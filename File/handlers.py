@@ -1,5 +1,8 @@
 import requests
-from aiogram import F, Router
+from enum import Enum
+from aiogram import Router, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
 
@@ -7,75 +10,77 @@ import keyboards as kb
 
 router = Router()
 
-class Currency:
-    def __init__(self):
-        self.basic = None
-        self.target = None
+# Список валют
+class CurrencyEnum(str, Enum):
+    USD = "USD"
+    RUB = "RUB"
 
-currency = Currency()
+# Состояния бота
+class CurrencyConversion(StatesGroup):
+    choosing_base = State()
+    choosing_target = State()
+    entering_amount = State()
 
+# /start — запуск
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
-        'Select the currency you want to convert to another currency!',
+        "👋 Привет! Выберите валюту, из которой хотите конвертировать:",
         reply_markup=kb.main_buttons
     )
+    await state.set_state(CurrencyConversion.choosing_base)
 
-@router.callback_query(F.data.in_({'USD', 'RUB'}))
-async def base_currency(callback: CallbackQuery):
-    currency.basic = callback.data
+# Выбор базовой валюты
+@router.callback_query(F.data.in_({c.value for c in CurrencyEnum}))
+async def choose_base(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(base=callback.data)
     await callback.answer()
     await callback.message.edit_text(
-        f'You chose the {callback.data}.',
+        f"Вы выбрали базовую валюту: {callback.data}\nТеперь выберите целевую валюту:",
         reply_markup=kb.main_buttons_2
     )
+    await state.set_state(CurrencyConversion.choosing_target)
 
-@router.callback_query(F.data.in_({'USD_2', 'RUB_2'}))
-async def target_currency(callback: CallbackQuery):
-    currency.target = callback.data
+# Выбор целевой валюты
+@router.callback_query(F.data.in_({f"{c.value}_2" for c in CurrencyEnum}))
+async def choose_target(callback: CallbackQuery, state: FSMContext):
+    target_currency = callback.data.replace("_2", "")
+    await state.update_data(target=target_currency)
     await callback.answer()
     await callback.message.edit_text(
-        f'You chose to convert to {callback.data}. Now, please enter the amount to convert:'
+        f"Целевая валюта: {target_currency}. Введите сумму для конвертации:"
     )
+    await state.set_state(CurrencyConversion.entering_amount)
 
-@router.message(F.text.isdigit())  # Фильтр отслеживает сообщения, содержащие только цифры
-async def conversion(message: Message):
-    # Проверка, выбрал ли пользователь базовую и целевую валюту
-    if not currency.basic or not currency.target:
-        await message.answer("Please select the currencies before entering the amount!")
-        return
+# Ввод суммы и расчет
+@router.message(CurrencyConversion.entering_amount, F.text)
+async def convert_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    base = data.get("base")
+    target = data.get("target")
 
     try:
-        # Преобразуем текст сообщения в число
         amount = float(message.text)
+        if amount <= 0:
+            raise ValueError
 
-        # Проверка, чтобы currency.basic был корректным
-        if currency.basic is None:
-            await message.answer("Base currency is not set!")
-            return
-
-        # Формируем запрос к API
-        url = f"https://api.exchangerate-api.com/v4/latest/{currency.basic}"
+        url = f"https://api.exchangerate-api.com/v4/latest/{base}"
         response = requests.get(url)
+        response.raise_for_status()
 
-        # Проверка успешности запроса
-        if response.status_code == 200:
-            data = response.json()
+        rates = response.json().get("rates", {})
+        rate = rates.get(target)
 
-            # Извлечение целевой валюты без "_2"
-            target_currency = currency.target.split('_')[0]
-
-            # Проверка наличия целевой валюты в данных API
-            if target_currency in data["rates"]:
-                conversion_rate = data["rates"][target_currency]
-                converted_amount = amount * conversion_rate
-                await message.answer(f"Converted amount: {converted_amount}")
-            else:
-                await message.answer("Target currency not found in exchange rates!")
+        if rate:
+            result = round(amount * rate, 2)
+            await message.answer(f"{amount} {base} = {result} {target}")
         else:
-            await message.answer("Failed to retrieve exchange rate data!")
-    except ValueError:
-        await message.answer("Invalid amount format. Please enter a valid number!")
-    except Exception as e:
-        await message.answer(f"An unexpected error occurred: {e}")
+            await message.answer("Ошибка: Целевая валюта не найдена в курсах.")
 
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректную положительную сумму.")
+    except Exception as e:
+        await message.answer(f"Произошла ошибка при получении данных: {e}")
+
+    await state.clear()
